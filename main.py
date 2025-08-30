@@ -60,9 +60,9 @@ val_start, val_end = idxs['val']
 test_start, test_end = idxs['test']
 
 # Merge train+val
-X_cats_trainval = np.concatenate([X_cats[train_start:val_end]])
-X_nums_trainval = np.concatenate([X_nums[train_start:val_end]])
-y_trainval      = np.concatenate([y[train_start:val_end]])
+X_cats_trainval = X_cats[train_start:val_end]
+X_nums_trainval = X_nums[train_start:val_end]
+y_trainval      = y[train_start:val_end]
 
 X_cats_test, X_nums_test, y_test = X_cats[test_start:test_end], X_nums[test_start:test_end], y[test_start:test_end]
 
@@ -83,16 +83,16 @@ for fold, (tr_idx, val_idx) in enumerate(kf.split(X_cats_trainval)):
     train_loader, val_loader, _ = gru.create_loaders(train_ds, val_ds, val_ds)
 
     # Fresh model
-    model = gru.create_model(cats_info, num_dim, WINDOW, device)
+    oof_model = gru.create_model(cats_info, num_dim, WINDOW, device)
     pos_weight = gru.get_pos_weight(y_trainval[tr_idx], device)
     criterion = gru.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-    optimizer = gru.get_optimizer(model)
+    optimizer = gru.get_optimizer(oof_model)
 
     # Train
-    model, history, best_val = gru.train_model(model, train_loader, val_loader, criterion, optimizer, device, epochs=5)
+    oof_model, history, best_val = gru.train_model(oof_model, train_loader, val_loader, criterion, optimizer, device, epochs=5)
 
     # Collect predictions on this fold’s validation set
-    val_p, _ = gru.collect_probs(model, val_loader, device)
+    val_p, _ = gru.collect_probs(oof_model, val_loader, device)
     oof_preds[val_idx] = val_p
 
 # %%
@@ -129,7 +129,7 @@ X = oof_df.drop(columns=["target"])
 y = oof_df["target"].astype(int)  # convert True/False to 1/0
 
 # Specify categorical columns (CatBoost handles them natively)
-cat_features = ["Job Category"]
+cat_features = ["Job Category", 'User ID']
 
 # Train/test split
 X_train, X_val, y_train, y_val = train_test_split(
@@ -141,25 +141,24 @@ train_pool = Pool(X_train, y_train, cat_features=cat_features)
 val_pool = Pool(X_val, y_val, cat_features=cat_features)
 
 # Initialize CatBoost model
-model = CatBoostClassifier(
+cat_model = CatBoostClassifier(
     iterations=500,
     learning_rate=0.05,
-    early_stopping_rounds=200,
     depth=6,
     od_type=None,
     eval_metric="PRAUC",
     loss_function="Logloss",
     verbose=100,
-    random_seed=42,
+    random_seed=50,
     auto_class_weights="Balanced"  # adjust for imbalance (1:negative, 10:positive as example)
 )
 
 # Train model
-model.fit(train_pool, eval_set=val_pool, early_stopping_rounds=500)
+cat_model.fit(train_pool, eval_set=val_pool, early_stopping_rounds=500)
 
 # Evaluate
-y_pred_proba = model.predict_proba(X_val)[:, 1]
-y_pred = model.predict(X_val)
+y_pred_proba = cat_model.predict_proba(X_val)[:, 1]
+y_pred = cat_model.predict(X_val)
 
 print("ROC AUC:", roc_auc_score(y_val, y_pred_proba))
 print("PR AUC:", average_precision_score(y_val, y_pred_proba))
@@ -168,3 +167,51 @@ print(classification_report(y_val, y_pred))
 # %%
 
 oof_df
+
+# %%
+# === Prepare test set features ===
+import numpy as np
+
+# Collect GRU probabilities for test set
+test_p, test_y = gru.collect_probs(model, test_loader, device)
+
+# Combine with User IDs
+test_user_ids = df['User ID'].values[test_start:test_end]
+test_df = pd.DataFrame({'User ID': test_user_ids, 'prediction': test_p})
+
+# Merge with static user_table
+test_df = test_df.merge(user_table, on='User ID', how='left')
+
+# Add target
+test_df['target'] = test_y
+
+# === Run CatBoost on test set ===
+X_test = test_df.drop(columns=["target"])
+y_test = test_df["target"].astype(int)
+
+test_pool = Pool(X_test, y_test, cat_features=["Job Category", "User ID"])
+
+# Predict
+test_pred_proba = cat_model.predict_proba(test_pool)[:, 1]
+test_pred = cat_model.predict(test_pool)
+
+# Metrics
+from sklearn.metrics import classification_report, roc_auc_score, average_precision_score
+
+print("Test ROC AUC:", roc_auc_score(y_test, test_pred_proba))
+print("Test PR AUC:", average_precision_score(y_test, test_pred_proba))
+print(classification_report(y_test, test_pred))
+
+
+# %% variable importance 
+import pandas as pd
+
+# If you trained with Pool(X, y, cat_features=...), reuse that same Pool
+# and pass the *exact* feature order used in training.
+feature_names = list(X_train.columns)  # or X_trv.columns if you used train+val
+
+imp = cat_model.get_feature_importance(train_pool, type="PredictionValuesChange")
+imp_df = pd.DataFrame({"feature": feature_names, "importance": imp})
+imp_df = imp_df.sort_values("importance", ascending=False).reset_index(drop=True)
+
+print(imp_df.head(20))

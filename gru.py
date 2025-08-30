@@ -70,7 +70,7 @@ def build_windows(df: pd.DataFrame, window_size=20):
     cat_code_cols = [c + '__code' for c in CAT_COLS]
     num_all_cols = BIN_COLS + NUM_COLS
 
-    X_cats, X_nums, y, end_ts = [], [], [], []
+    X_cats, X_nums, y, end_ts, user_ids = [], [], [], [], []
 
     for uid, g in df.groupby('User ID', sort=False):
         g = g.sort_values('Login Timestamp')
@@ -96,12 +96,14 @@ def build_windows(df: pd.DataFrame, window_size=20):
             X_nums.append(nums_win)
             y.append(labels[end])             # label for current timestep
             end_ts.append(ts[end])            # window ends at this timestamp
+            user_ids.append(uid)              # keep User ID for merging later
 
     X_cats = np.stack(X_cats)                      # (N, T, C)
     X_nums = np.stack(X_nums)                      # (N, T, D)
     y = np.asarray(y, dtype=np.float32)            # BCE expects float
     end_ts = np.asarray(end_ts, dtype=np.int64)    # for chronological split
-    return X_cats, X_nums, y, end_ts
+    user_ids = np.asarray(user_ids)                # (N,)
+    return X_cats, X_nums, y, end_ts, user_ids
 
 # ==== 4) PyTorch Dataset ====
 class SeqDataset(Dataset):

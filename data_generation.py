@@ -15,7 +15,7 @@ def generate_user_table(df):
 	# Generate ages: older for account takeover, younger otherwise
 	ages = np.where(
 		user_table['Any Account Takeover'],
-		np.random.normal(loc=45, scale=8, size=len(user_table)),  # Skew older
+		np.random.normal(loc=55, scale=8, size=len(user_table)),  # Skew older
 		np.random.normal(loc=35, scale=10, size=len(user_table))  # Skew younger
 	)
 	# Clip ages to reasonable range

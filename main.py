@@ -48,170 +48,170 @@ gru.print_metrics(val_y, val_p, test_y, test_p)
 
 # %%
 #Step 9: Generate user table
+import data_generation
+importlib.reload(data_generation)
 from data_generation import generate_user_table
 
 user_table = generate_user_table(downsampled_df.to_pandas())
 
 # %%
-import numpy as np
 
+# === Split the original train+val region into two halves, train on the first, predict on the second ===
+import numpy as np
+import pandas as pd
+
+# 1) Slice out the original train+val span (chronological)
 train_start, train_end = idxs['train']
-val_start, val_end = idxs['val']
-test_start, test_end = idxs['test']
+val_start,   val_end   = idxs['val']
+tv_start, tv_end = train_start, val_end   # inclusive train..val block from the first split
 
-# Merge train+val
-X_cats_trainval = X_cats[train_start:val_end]
-X_nums_trainval = X_nums[train_start:val_end]
-y_trainval      = y[train_start:val_end]
+X_cats_trainval = X_cats[tv_start:tv_end]   
+X_nums_trainval = X_nums[tv_start:tv_end]
+y_trainval      = y[tv_start:tv_end]
+end_ts_trainval = end_ts[tv_start:tv_end]
 
-X_cats_test, X_nums_test, y_test = X_cats[test_start:test_end], X_nums[test_start:test_end], y[test_start:test_end]
-
-
-# %%
-from sklearn.model_selection import KFold
-
-kf = KFold(n_splits=5, shuffle=False)  # no shuffle, keeps order
-oof_preds = np.zeros(len(y_trainval))
-device = gru.get_device()
-num_dim = X_nums.shape[-1]
-
-for fold, (tr_idx, val_idx) in enumerate(kf.split(X_cats_trainval)):
-    print(f"=== Fold {fold+1} ===")
-    # Build datasets
-    train_ds = gru.SeqDataset(X_cats_trainval[tr_idx], X_nums_trainval[tr_idx], y_trainval[tr_idx])
-    val_ds   = gru.SeqDataset(X_cats_trainval[val_idx], X_nums_trainval[val_idx], y_trainval[val_idx])
-    train_loader, val_loader, _ = gru.create_loaders(train_ds, val_ds, val_ds)
-
-    # Fresh model
-    oof_model = gru.create_model(cats_info, num_dim, WINDOW, device)
-    pos_weight = gru.get_pos_weight(y_trainval[tr_idx], device)
-    criterion = gru.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-    optimizer = gru.get_optimizer(oof_model)
-
-    # Train
-    oof_model, history, best_val = gru.train_model(oof_model, train_loader, val_loader, criterion, optimizer, device, epochs=5)
-
-    # Collect predictions on this fold’s validation set
-    val_p, _ = gru.collect_probs(oof_model, val_loader, device)
-    oof_preds[val_idx] = val_p
-
-# %%
-import pandas as pd
-
-# combine the oof_preds with the User IDs
-user_ids = np.concatenate([df['User ID'].values[train_start:val_end]])
-oof_df = pd.DataFrame({'User ID': user_ids, 'prediction': oof_preds})
-
-# %%
-# merge with the user_table
-oof_df = oof_df.merge(user_table, on='User ID', how='left')
-
-# drop the Any Account Takeover column
-oof_df = oof_df.drop(columns=['Any Account Takeover', 'Is Account Takeover'])
-
-# add y_trainval as the target
-oof_df['target'] = y_trainval
-
-# %%
-oof_df.target.sum()
-
-# %%  show rows where Is Account Takeover is True
-np.sum(y_trainval)
-# %%
-
-import pandas as pd
-from catboost import CatBoostClassifier, Pool
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report, roc_auc_score, average_precision_score
-
-# Features and target
-X = oof_df.drop(columns=["target"])  
-y = oof_df["target"].astype(int)  # convert True/False to 1/0
-
-# Specify categorical columns (CatBoost handles them natively)
-cat_features = ["Job Category", 'User ID']
-
-# Train/test split
-X_train, X_val, y_train, y_val = train_test_split(
-    X, y, test_size=0.4, random_state=42, stratify=y
+# 2) Within that block, split 50/50 by positives (chronologically) and set no "test" portion
+X_cats_tv2, X_nums_tv2, y_tv2, idxs_tv2 = gru.stratified_chronological_split(
+    X_cats_trainval, X_nums_trainval, y_trainval, end_ts_trainval,
+    train_pos_ratio=0.5, val_pos_ratio=0.5, test_pos_ratio=0.0
 )
 
-# Define Pools (CatBoost requires this for categorical features)
-train_pool = Pool(X_train, y_train, cat_features=cat_features)
-val_pool = Pool(X_val, y_val, cat_features=cat_features)
+# 3) Datasets & loaders for the inner split
+train_ds2, val_ds2, _ = gru.create_datasets(X_cats_tv2, X_nums_tv2, y_tv2, idxs_tv2)
+train_loader2, val_loader2, _ = gru.create_loaders(train_ds2, val_ds2, None)
 
-# Initialize CatBoost model
-cat_model = CatBoostClassifier(
-    iterations=500,
-    learning_rate=0.05,
-    depth=6,
-    od_type=None,
-    eval_metric="PRAUC",
-    loss_function="Logloss",
-    verbose=100,
-    random_seed=50,
-    auto_class_weights="Balanced"  # adjust for imbalance (1:negative, 10:positive as example)
-)
+# 4) Fresh model and weighted loss computed only from the inner-train slice (prevents leakage)
+device   = gru.get_device()
+num_dim  = X_nums.shape[-1]   # same numeric feature width as before
+WINDOW   = X_cats.shape[1]    # or keep your constant, e.g., WINDOW = 20 used earlier
+model2   = gru.create_model(cats_info, num_dim, WINDOW, device)
 
-# Train model
-cat_model.fit(train_pool, eval_set=val_pool, early_stopping_rounds=500)
+inner_train_y = y_tv2[idxs_tv2['train'][0]:idxs_tv2['train'][1]]
+pos_weight    = gru.get_pos_weight(inner_train_y, device)
 
-# Evaluate
-y_pred_proba = cat_model.predict_proba(X_val)[:, 1]
-y_pred = cat_model.predict(X_val)
+criterion2 = gru.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+optimizer2 = gru.get_optimizer(model2)
 
-print("ROC AUC:", roc_auc_score(y_val, y_pred_proba))
-print("PR AUC:", average_precision_score(y_val, y_pred_proba))
-print(classification_report(y_val, y_pred))
+# 5) Train and then score the inner-validation half
+model2, hist2, best_val2 = gru.train_model(model2, train_loader2, val_loader2, criterion2, optimizer2, device, epochs=5)
+val_p2, val_y2 = gru.collect_probs(model2, val_loader2, device)
+
+# 6) Map inner-validation rows back to absolute indices and to User IDs for merging later
+inner_val_start, inner_val_end = idxs_tv2['val']
+# indices relative to the train+val block:
+rel_idx_tv2 = np.arange(0, len(y_trainval))
+rel_val_idx = rel_idx_tv2[inner_val_start:inner_val_end]
+# absolute indices w.r.t. the full (X_cats, X_nums, y)
+abs_val_idx = (tv_start + rel_val_idx)
+
+# grab the corresponding User IDs from the array returned by build_windows
+val_user_ids = user_ids[abs_val_idx]
+
+# 7) Final DataFrame of OOF-style predictions for this val half
+oof_val = pd.DataFrame({
+    "abs_index": abs_val_idx,
+    "User ID":   val_user_ids,
+    "y_true":    val_y2.astype(int),
+    "p_hat":     val_p2
+}).reset_index(drop=True)
+
+print(oof_val.head())
+print(f"\nInner-split validation size: {len(oof_val)}")
 
 # %%
+# merge with user_table
+oof_val = oof_val.merge(user_table, on="User ID", how="left")
 
-oof_df
+oof_val
 
 # %%
-# === Prepare test set features ===
+# drop abs_index, y_true, Any_Account_Takeover
+oof_val = oof_val.drop(columns=["abs_index", "Is Account Takeover", "Any Account Takeover"], errors="ignore")
+
+
+# %% oof_val
+#oof_val = oof_val.drop(columns=["User ID"], errors="ignore")
+
+
+
+# %%  
+# train logistic regression model using only p_hat and Age from oof_val
 import numpy as np
-
-# Collect GRU probabilities for test set
-test_p, test_y = gru.collect_probs(model, test_loader, device)
-
-# Combine with User IDs
-test_user_ids = df['User ID'].values[test_start:test_end]
-test_df = pd.DataFrame({'User ID': test_user_ids, 'prediction': test_p})
-
-# Merge with static user_table
-test_df = test_df.merge(user_table, on='User ID', how='left')
-
-# Add target
-test_df['target'] = test_y
-
-# === Run CatBoost on test set ===
-X_test = test_df.drop(columns=["target"])
-y_test = test_df["target"].astype(int)
-
-test_pool = Pool(X_test, y_test, cat_features=["Job Category", "User ID"])
-
-# Predict
-test_pred_proba = cat_model.predict_proba(test_pool)[:, 1]
-test_pred = cat_model.predict(test_pool)
-
-# Metrics
-from sklearn.metrics import classification_report, roc_auc_score, average_precision_score
-
-print("Test ROC AUC:", roc_auc_score(y_test, test_pred_proba))
-print("Test PR AUC:", average_precision_score(y_test, test_pred_proba))
-print(classification_report(y_test, test_pred))
-
-
-# %% variable importance 
 import pandas as pd
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score, accuracy_score
 
-# If you trained with Pool(X, y, cat_features=...), reuse that same Pool
-# and pass the *exact* feature order used in training.
-feature_names = list(X_train.columns)  # or X_trv.columns if you used train+val
+# Prepare features and target
+X = oof_val[["p_hat", "Age"]].values
+y = oof_val["y_true"].values if "y_true" in oof_val.columns else None
 
-imp = cat_model.get_feature_importance(train_pool, type="PredictionValuesChange")
-imp_df = pd.DataFrame({"feature": feature_names, "importance": imp})
-imp_df = imp_df.sort_values("importance", ascending=False).reset_index(drop=True)
+# Remove rows with missing values
+mask = ~np.isnan(X).any(axis=1)
+X = X[mask]
+if y is not None:
+    y = y[mask]
 
-print(imp_df.head(20))
+# Train logistic regression
+if y is not None:
+    lr = LogisticRegression(class_weight='balanced')
+    lr.fit(X, y)
+    preds = lr.predict_proba(X)[:, 1]
+    auc = roc_auc_score(y, preds)
+    acc = accuracy_score(y, preds > 0.5)
+    print(f"Logistic Regression AUC: {auc:.4f}")
+    print(f"Logistic Regression Accuracy: {acc:.4f}")
+    # Optionally, print coefficients
+    print(f"Coefficients: {lr.coef_}")
+    from sklearn.metrics import average_precision_score
+    auprc = average_precision_score(y, preds)
+    print(f"Logistic Regression AUPRC: {auprc:.4f}")
+else:
+    print("y_true column not found in oof_val. Cannot train logistic regression.")
+
+# %%
+import numpy as np
+import pandas as pd
+from sklearn.metrics import average_precision_score, roc_auc_score, accuracy_score
+
+
+
+# --- Use the SAME arrays/datasets that produced test_p/test_y ---
+# We already have: test_p, test_y from collect_probs(...)
+
+# Get the test user IDs from the ORIGINAL arrays & idxs used to build test_loader
+test_start, test_end = idxs['test']
+test_user_ids = user_ids[test_start:test_end]  # from the original build_windows
+
+test_df = pd.DataFrame({
+    "User ID": test_user_ids,
+    "y_true":  test_y.astype(int),   # <-- use the labels collected with test_p
+    "p_hat":   test_p
+})
+
+# Merge static features
+test_df = test_df.merge(user_table, on="User ID", how="left")
+
+# Coerce numeric Age and drop missing rows (same preprocessing as training)
+test_df["Age"] = pd.to_numeric(test_df["Age"], errors="coerce")
+test_df = test_df.dropna(subset=["p_hat", "Age", "y_true"])
+
+X_test = test_df[["p_hat", "Age"]].to_numpy()
+y_test = test_df["y_true"].to_numpy()
+
+# Reuse the trained logistic regression 'lr'
+test_preds = lr.predict_proba(X_test)[:, 1]
+
+from sklearn.metrics import average_precision_score, roc_auc_score, accuracy_score
+print(f"Test AUPRC: {average_precision_score(y_test, test_preds):.4f}")
+print(f"Test AUC:   {roc_auc_score(y_test, test_preds):.4f}")
+print(f"Test Acc:   {accuracy_score(y_test, test_preds > 0.5):.4f}")
+
+# %%
+# compute AUPRC with just the p_hat and the y_true
+
+
+auprc = average_precision_score(test_y, test_p)
+print(f"AUPRC: {auprc:.4f}")
+# %%
+
+print("LR coef on [p_hat, Age]:", lr.coef_)

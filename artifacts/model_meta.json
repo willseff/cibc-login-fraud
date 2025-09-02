@@ -1,0 +1,29 @@
+{
+  "window_size": 20,
+  "cats_info": {
+    "Country": {
+      "vocab_size": 103
+    },
+    "Region": {
+      "vocab_size": 430
+    },
+    "City": {
+      "vocab_size": 2443
+    },
+    "User Agent String": {
+      "vocab_size": 15298
+    },
+    "Browser Name and Version": {
+      "vocab_size": 741
+    },
+    "OS Name and Version": {
+      "vocab_size": 235
+    },
+    "Device Type": {
+      "vocab_size": 7
+    },
+    "Success Group": {
+      "vocab_size": 1006
+    }
+  }
+}

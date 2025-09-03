@@ -312,7 +312,7 @@ def render_methodology():
     st.markdown("### Training & Evaluation")
     st.markdown("""
     - **Split**: Chronological, stratified to preserve positives across train/val/test (prevents leakage).
-    - **Efficiency**: Optional downsampling of negatives for faster training.
+    - **Efficiency**: Downsampling of negatives for faster training.
     - **Metrics**: **AUPRC** (primary) and AUROC (secondary).
     - **Threshold tuning**: Emphasis on precision/recall trade-offs for fraud ops.
     """)
